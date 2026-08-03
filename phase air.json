@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "tiles": {},
+  "tokens": {
+    "4,7": [
+      {
+        "type": "nox",
+        "state": {
+          "direction": "S",
+          "level": 6
+        }
+      }
+    ],
+    "4,2": [
+      {
+        "type": "osamodas",
+        "state": {
+          "immune": false
+        }
+      },
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "9,13": [
+      {
+        "type": "sram",
+        "state": {
+          "immune": false
+        }
+      }
+    ],
+    "3,12": [
+      {
+        "type": "eniripsa",
+        "state": {
+          "immune": true
+        }
+      }
+    ],
+    "9,7": [
+      {
+        "type": "sadida",
+        "state": {
+          "immune": false
+        }
+      }
+    ],
+    "1,9": [
+      {
+        "type": "steamer",
+        "state": {
+          "immune": false
+        }
+      },
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "7,4": [
+      {
+        "type": "iop",
+        "state": {
+          "immune": false
+        }
+      }
+    ],
+    "1,4": [
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "8,4": [
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "8,9": [
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "8,12": [
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "4,9": [
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "7,10": [
+      {
+        "type": "eni_lapin",
+        "state": {}
+      }
+    ],
+    "6,10": [
+      {
+        "type": "surpuissante",
+        "state": {}
+      }
+    ],
+    "4,12": [
+      {
+        "type": "steamer_turret",
+        "state": {}
+      },
+      {
+        "type": "steamer_microbot",
+        "state": {}
+      }
+    ],
+    "4,13": [
+      {
+        "type": "steamer_turret",
+        "state": {}
+      }
+    ]
+  },
+  "arrows": [
+    {
+      "start": [
+        9,
+        13
+      ],
+      "end": [
+        6,
+        10
+      ],
+      "color": "#ff808080"
+    },
+    {
+      "start": [
+        7,
+        4
+      ],
+      "end": [
+        2,
+        10
+      ],
+      "color": "#ffff0000"
+    },
+    {
+      "start": [
+        4,
+        2
+      ],
+      "end": [
+        4,
+        6
+      ],
+      "color": "#ffffffff"
+    },
+    {
+      "start": [
+        1,
+        9
+      ],
+      "end": [
+        5,
+        12
+      ],
+      "color": "#ffffa500"
+    },
+    {
+      "start": [
+        9,
+        7
+      ],
+      "end": [
+        1,
+        9
+      ],
+      "color": "#ff32cd32"
+    }
+  ],
+  "player_order": [
+    [
+      4,
+      2,
+      0
+    ],
+    [
+      3,
+      12,
+      0
+    ],
+    [
+      1,
+      9,
+      0
+    ],
+    [
+      9,
+      7,
+      0
+    ],
+    [
+      9,
+      13,
+      0
+    ],
+    [
+      7,
+      4,
+      0
+    ]
+  ],
+  "nox_element": "air"
+}
