@@ -31,17 +31,183 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QWidget,
     QHBoxLayout,
+    QTabWidget,
+    QTabBar,
+    QInputDialog,
 )
 from PyQt5.QtGui import QPolygonF, QBrush, QColor, QPen, QPainter, QPixmap, QFont, QKeySequence, QIcon
-from PyQt5.QtCore import QPointF, Qt, QTimer, QSize
+from PyQt5.QtCore import QPointF, Qt, QTimer, QSize, QObject, pyqtSignal
 from enum import Enum
-
-
+import socket
+import secrets
+import threading
 TILE_WIDTH = 64
 TILE_HEIGHT = 32
 ROWS = 16
 COLS = 18
 
+#
+# RESEAU
+#
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except OSError:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+def generate_password():
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+class NetworkBridge(QObject):
+    op_received = pyqtSignal(dict)
+    snapshot_received = pyqtSignal(dict)
+    auth_failed = pyqtSignal()
+    client_count_changed = pyqtSignal(int)
+    disconnected = pyqtSignal()
+
+
+class HostServer:
+    def __init__(self, scene, password, bridge):
+        self.scene = scene
+        self.password = password
+        self.bridge = bridge
+        self.clients = []
+        self.server_socket = None
+        self._running = False
+
+    def start(self, port=5555):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(("0.0.0.0", port))
+        self.server_socket.listen(5)
+        self._running = True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                conn, addr = self.server_socket.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+
+    def _handle_client(self, conn):
+        try:
+            data = conn.recv(4096).decode("utf-8")
+            msg = json.loads(data.strip())
+            if msg.get("type") != "auth" or msg.get("password") != self.password:
+                conn.sendall((json.dumps({"type": "auth_fail"}) + "\n").encode("utf-8"))
+                conn.close()
+                return
+        except (OSError, json.JSONDecodeError):
+            conn.close()
+            return
+
+        snapshot_msg = {"type": "auth_ok", "snapshot": self.scene.to_dict()}
+        conn.sendall((json.dumps(snapshot_msg) + "\n").encode("utf-8"))
+        self.clients.append(conn)
+        self.bridge.client_count_changed.emit(len(self.clients))
+
+        buffer = ""
+        while self._running:
+            try:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if line.strip():
+                        m = json.loads(line)
+                        if m.get("type") == "op":
+                            self.bridge.op_received.emit(m["op"])
+                            self.broadcast(m, exclude=conn)
+            except (OSError, json.JSONDecodeError):
+                break
+
+        if conn in self.clients:
+            self.clients.remove(conn)
+        self.bridge.client_count_changed.emit(len(self.clients))
+        conn.close()
+
+    def broadcast(self, msg, exclude=None):
+        data = (json.dumps(msg) + "\n").encode("utf-8")
+        for c in list(self.clients):
+            if c is not exclude:
+                try:
+                    c.sendall(data)
+                except OSError:
+                    pass
+
+    def send_op(self, op):
+        self.broadcast({"type": "op", "op": op})
+
+    def stop(self):
+        self._running = False
+        if self.server_socket:
+            self.server_socket.close()
+        for c in self.clients:
+            c.close()
+
+
+class ClientConnection:
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.sock = None
+        self._running = False
+
+    def connect(self, ip, port, password):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(5)
+        self.sock.connect((ip, port))
+        self.sock.sendall((json.dumps({"type": "auth", "password": password}) + "\n").encode("utf-8"))
+        self.sock.settimeout(None)
+        self._running = True
+        threading.Thread(target=self._listen_loop, daemon=True).start()
+
+    def _listen_loop(self):
+        buffer = ""
+        while self._running:
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    msg = json.loads(line)
+                    if msg["type"] == "auth_fail":
+                        self.bridge.auth_failed.emit()
+                        return
+                    elif msg["type"] == "auth_ok":
+                        self.bridge.snapshot_received.emit(msg["snapshot"])
+                    elif msg["type"] == "op":
+                        self.bridge.op_received.emit(msg["op"])
+            except (OSError, json.JSONDecodeError):
+                break
+        self.bridge.disconnected.emit()
+
+    def send_op(self, op):
+        if self.sock:
+            try:
+                self.sock.sendall((json.dumps({"type": "op", "op": op}) + "\n").encode("utf-8"))
+            except OSError:
+                pass
+
+    def disconnect(self):
+        self._running = False
+        if self.sock:
+            self.sock.close()
 
 class EditorMode(Enum):
     PAINT = 0
@@ -49,6 +215,9 @@ class EditorMode(Enum):
     ARROW = 2
     ERASE = 3
 
+#
+# TOKENS/INFO
+#
 
 ASSETS_DIR = "assets/tokens"
 
@@ -63,51 +232,80 @@ ELEMENT_COLORS = {
 }
 
 TOKEN_LIBRARY = {
-    "feca":          {"label": "Féca",         "image": "feca.png",         "color": QColor(120, 170, 90) , "offset_y": 0, "category": "player"},
-    "osamodas":      {"label": "Osamodas",     "image": "osamodas.png",     "color": QColor(150, 110, 60)  , "offset_y": 0, "category": "player"},
-    "enutrof":       {"label": "Enutrof",      "image": "enutrof.png",      "color": QColor(160, 140, 40), "offset_y": 0, "category": "player"},
-    "sram":          {"label": "Sram",         "image": "sram.png",         "color": QColor(70, 70, 80), "offset_y": 0, "category": "player"},
-    "xelor":         {"label": "Xelor",        "image": "xelor.png",        "color": QColor(90, 90, 160),    "offset_y": 0, "category": "player"},
-    "ecaflip":       {"label": "Ecaflip",      "image": "ecaflip.png",      "color": QColor(200, 150, 60),   "offset_y": 0, "category": "player"},
-    "eniripsa":      {"label": "Eniripsa",     "image": "eniripsa.png",     "color": QColor(220, 120, 150),  "offset_y": 0, "category": "player"},
-    "iop":           {"label": "Iop",          "image": "iop.png",          "color": QColor(200, 60, 60),    "offset_y": 0, "category": "player"},
-    "cra":           {"label": "Cra",          "image": "cra.png",          "color": QColor(60, 140, 90),    "offset_y": 0, "category": "player"},
-    "sadida":        {"label": "Sadida",       "image": "sadida.png",       "color": QColor(90, 150, 60),    "offset_y": 0, "category": "player", "children":["surpuissante","bloqueuse", "sacrif", "goulue", "arbre", "gonflable", "graine"]},
-    "sacrieur":      {"label": "Sacrieur",     "image": "sacrieur.png",     "color": QColor(150, 40, 40),    "offset_y": 0, "category": "player"},
-    "pandawa":       {"label": "Pandawa",      "image": "pandawa.png",      "color": QColor(90, 60, 40),     "offset_y": 0, "category": "player"},
-    "roublard":      {"label": "Roublard",     "image": "roublard.png",     "color": QColor(60, 60, 60),     "offset_y": 0, "category": "player"},
-    "zobal":         {"label": "Zobal",        "image": "zobal.png",        "color": QColor(140, 90, 140),   "offset_y": 0, "category": "player"},
-    "eliotrope":     {"label": "Eliotrope",    "image": "eliotrope.png",    "color": QColor(90, 60, 160),    "offset_y": 0, "category": "player"},
-    "huppermage":    {"label": "Huppermage",   "image": "huppermage.png",   "color": QColor(160, 60, 160),   "offset_y": 0, "category": "player"},
-    "ouginak":       {"label": "Ouginak",      "image": "ouginak.png",      "color": QColor(120, 90, 60),    "offset_y": 0, "category": "player"},
-    "steamer":       {"label": "Steamer",      "image": "steamer.png",      "color": QColor(150, 150, 60),   "offset_y": 0, "category": "player", "children": ["steamer_microbot", "steamer_turret"]},
+    "feca": {"label": "Féca", "image": "feca.png", "color": QColor(120, 170, 90), "offset_y": 0, "category": "player"},
+    "osamodas": {"label": "Osamodas", "image": "osamodas.png", "color": QColor(150, 110, 60), "offset_y": 0,
+                 "category": "player"},
+    "enutrof": {"label": "Enutrof", "image": "enutrof.png", "color": QColor(160, 140, 40), "offset_y": 0,
+                "category": "player"},
+    "sram": {"label": "Sram", "image": "sram.png", "color": QColor(70, 70, 80), "offset_y": 0, "category": "player"},
+    "xelor": {"label": "Xelor", "image": "xelor.png", "color": QColor(90, 90, 160), "offset_y": 0, "category": "player",
+              "children": ["xelor_cadran", "rouage", "sinistro", "regu"]},
+    "ecaflip": {"label": "Ecaflip", "image": "ecaflip.png", "color": QColor(200, 150, 60), "offset_y": 0,
+                "category": "player"},
+    "eniripsa": {"label": "Eniripsa", "image": "eniripsa.png", "color": QColor(220, 120, 150), "offset_y": 0,
+                 "category": "player"},
+    "iop": {"label": "Iop", "image": "iop.png", "color": QColor(200, 60, 60), "offset_y": 0, "category": "player"},
+    "cra": {"label": "Cra", "image": "cra.png", "color": QColor(60, 140, 90), "offset_y": 0, "category": "player"},
+    "sadida": {"label": "Sadida", "image": "sadida.png", "color": QColor(90, 150, 60), "offset_y": 0,
+               "category": "player",
+               "children": ["surpuissante", "bloqueuse", "sacrif", "goulue", "arbre", "gonflable", "graine"]},
+    "sacrieur": {"label": "Sacrieur", "image": "sacrieur.png", "color": QColor(150, 40, 40), "offset_y": 0,
+                 "category": "player"},
+    "pandawa": {"label": "Pandawa", "image": "pandawa.png", "color": QColor(90, 60, 40), "offset_y": 0,
+                "category": "player"},
+    "roublard": {"label": "Roublard", "image": "roublard.png", "color": QColor(60, 60, 60), "offset_y": 0,
+                 "category": "player"},
+    "zobal": {"label": "Zobal", "image": "zobal.png", "color": QColor(140, 90, 140), "offset_y": 0,
+              "category": "player"},
+    "eliotrope": {"label": "Eliotrope", "image": "eliotrope.png", "color": QColor(90, 60, 160), "offset_y": 0,
+                  "category": "player"},
+    "huppermage": {"label": "Huppermage", "image": "huppermage.png", "color": QColor(160, 60, 160), "offset_y": 0,
+                   "category": "player"},
+    "ouginak": {"label": "Ouginak", "image": "ouginak.png", "color": QColor(120, 90, 60), "offset_y": 0,
+                "category": "player"},
+    "steamer": {"label": "Steamer", "image": "steamer.png", "color": QColor(150, 150, 60), "offset_y": 0,
+                "category": "player", "children": ["steamer_microbot", "steamer_turret"]},
     # tokens speciaux / mecanismes-invocations
-    "xelor_cadran":        {"label": "Cadran (Xelor)",         "image": "xelor_cadran.png",        "color": QColor(90, 90, 200),   "hover_range": 3, "offset_y": 0, "category": "mechanism", "unique": True},
-    "eni_lapin":           {"label": "Lapin (Eniripsa)",       "image": "eni_lapin.png",           "color": QColor(230, 150, 180),  "offset_y": 0, "category": "mechanism", "unique": True},
-    "surpuissante": {"label": "Surpuissante (Sadida)",  "image": "sadida_surpuissante.png", "color": QColor(60, 180, 60),    "offset_y": -8, "category": "mechanism"},
-    "bloqueuse": {"label": "bloqueuse (Sadida)",  "image": "bloqueuse.png", "color": QColor(60, 180, 60),    "offset_y": -8, "category": "mechanism"},
-    "goulue": {"label": "goulue (Sadida)",  "image": "goulue.png", "color": QColor(60, 180, 60),   "offset_y": -7, "category": "mechanism"},
-    "gonflable": {"label": "gonflable (Sadida)",  "image": "gonflable.png", "color": QColor(60, 180, 60),    "offset_y": -2, "category": "mechanism"},
-    "arbre": {"label": "arbre (Sadida)",  "image": "arbre.png", "color": QColor(60, 180, 60),    "offset_y": -1, "category": "mechanism"},
-    "sacrif": {"label": "sacrif (Sadida)",  "image": "sacrif.png", "color": QColor(60, 180, 60),    "offset_y": -1, "category": "mechanism"},
-    "graine": {"label": "graine (Sadida)",  "image": "graine.png", "color": QColor(60, 180, 60),    "offset_y": -16, "category": "mechanism"},
-    "steamer_microbot":    {"label": "Microbot (Steamer)",     "image": "steamer_microbot.png",    "color": QColor(200, 200, 60),   "rail": True, "offset_y": -16, "category": "mechanism"},
-    "steamer_turret":      {"label": "Tourelle (Steamer)",     "image": "tourelle.png",      "color": QColor(180, 130, 40),   "offset_y": 0, "category": "mechanism"},
+    "xelor_cadran": {"label": "Cadran (Xelor)", "image": "xelor_cadran.png", "color": QColor(90, 90, 200),
+                     "hover_range": 3, "offset_y": 8, "category": "mechanism", "unique": True},
+    "eni_lapin": {"label": "Lapin (Eniripsa)", "image": "eni_lapin.png", "color": QColor(230, 150, 180), "offset_y": 0,
+                  "category": "mechanism", "unique": True},
+    "surpuissante": {"label": "Surpuissante (Sadida)", "image": "sadida_surpuissante.png", "color": QColor(60, 180, 60),
+                     "offset_y": -8, "category": "mechanism"},
+    "bloqueuse": {"label": "bloqueuse (Sadida)", "image": "bloqueuse.png", "color": QColor(60, 180, 60), "offset_y": -8,
+                  "category": "mechanism"},
+    "goulue": {"label": "goulue (Sadida)", "image": "goulue.png", "color": QColor(60, 180, 60), "offset_y": -7,
+               "category": "mechanism"},
+    "gonflable": {"label": "gonflable (Sadida)", "image": "gonflable.png", "color": QColor(60, 180, 60), "offset_y": -2,
+                  "category": "mechanism"},
+    "arbre": {"label": "arbre (Sadida)", "image": "arbre.png", "color": QColor(60, 180, 60), "offset_y": -1,
+              "category": "mechanism"},
+    "sacrif": {"label": "sacrif (Sadida)", "image": "sacrif.png", "color": QColor(60, 180, 60), "offset_y": -1,
+               "category": "mechanism"},
+    "graine": {"label": "graine (Sadida)", "image": "graine.png", "color": QColor(60, 180, 60), "offset_y": -16,
+               "category": "mechanism"},
+    "steamer_microbot": {"label": "Microbot (Steamer)", "image": "steamer_microbot.png", "color": QColor(200, 200, 60),
+                         "rail": True, "offset_y": -16, "category": "mechanism"},
+    "steamer_turret": {"label": "Tourelle (Steamer)", "image": "tourelle.png", "color": QColor(180, 130, 40),
+                       "offset_y": 0, "category": "mechanism"},
+    "rouage": {"label": "rouage (Xelor)", "image": "rouage.png", "color": QColor(180, 130, 40), "offset_y": -8,
+               "category": "mechanism"},
+    "regu": {"label": "regulateur (Xelor)", "image": "regu.png", "color": QColor(180, 130, 40), "offset_y": -4,
+             "category": "mechanism"},
+    "sinistro": {"label": "sinistro (Xelor)", "image": "sinistro.png", "color": QColor(180, 130, 40), "offset_y": -2,
+                 "category": "mechanism"},
     # token auto : se pose tout seul sur les microbots des qu'ils sont alignes par 2 ou plus
-    "steamer_rail":        {"label": "Rail (Steamer)",         "image": "steamer_rail.png",        "color": QColor(90, 120, 140),  "auto_only": True, "offset_y": -16, "category": "mechanism"},
+    "steamer_rail": {"label": "Rail (Steamer)", "image": "steamer_rail.png", "color": QColor(90, 120, 140),
+                     "auto_only": True, "offset_y": -16, "category": "mechanism"},
     # totem Nox : direction (N/E/S/O, tournee au clic droit) + niveau (1-6, molette au
     # survol) ; sa zone d'effet au survol depend en plus de l'element choisi dans la
     # toolbar (eau/air/feu/terre). Voir NoxToken.
-    "nox":                 {"label": "Totem Nox",              "image": "nox.png",                 "color": QColor(80, 80, 95),    "offset_y": 0, "category": "nox", "unique": True},
+    "nox": {"label": "Totem Nox", "image": "nox.png", "color": QColor(80, 80, 95), "offset_y": 0, "category": "nox",
+            "unique": True},
 }
-
 
 RAIL_MAX_LENGTH = 8  # deux microbots ne forment un rail que si la case de depart a la case d'arrivee incluses tient sur 8 cases max
 MAX_PLAYERS = 6  # nombre maximum de tokens de categorie "player" simultanement sur la carte
-
-# Couleur d'une fleche selon la position (index) de son token de depart dans le
-# panneau de joueurs : 1er joueur -> bleu, 2e -> rose, etc. Les tokens hors panneau
-# (mecanismes, Nox) utilisent ARROW_DEFAULT_COLOR.
 ARROW_COLORS = [
     QColor("dodgerblue"),
     QColor("deeppink"),
@@ -118,15 +316,16 @@ ARROW_COLORS = [
 ]
 ARROW_DEFAULT_COLOR = QColor("white")
 
-
 # ---------- geometrie des zones du totem Nox ----------
 DIRECTION_VECTORS = {"N": (-1, 0), "S": (1, 0), "E": (0, 1), "O": (0, -1)}
 OPPOSITE_DIRECTION = {"N": "S", "S": "N", "E": "O", "O": "E"}
 
 
+# calculs de zones et affichage de tokens
 def cone_cells(apex, direction, depth):
     """Cone triangulaire classique : ouvert dans `direction`, apex a `apex`, la rangee
-    a distance d (1..depth) a une largeur de 2d-1 cases (large loin de l'apex)."""
+    a distance d (1..depth) a une largeur de 2d-1 cases (large loin de l'apex).
+    Ajoute aussi les 4 diagonales partant de l'apex, chacune limitee a `depth` cases."""
     dr, dc = DIRECTION_VECTORS[direction]
     pr, pc = -dc, dr
     cells = set()
@@ -135,9 +334,13 @@ def cone_cells(apex, direction, depth):
         base_c = apex[1] + dc * d
         for w in range(-(d - 1), d):
             cells.add((base_r + pr * w, base_c + pc * w))
+
+    diagonal_vectors = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+    for ddr, ddc in diagonal_vectors:
+        for d in range(1, depth + 1):
+            cells.add((apex[0] + ddr * d, apex[1] + ddc * d))
+
     return cells
-
-
 def terre_cone_cells(apex, direction, depth):
     """Cone de la zone Terre : contrairement a cone_cells, la base (la plus large,
     2*depth-1 cases) est CENTREE SUR NOX (distance 0, sa propre rangee), et la forme
@@ -153,8 +356,6 @@ def terre_cone_cells(apex, direction, depth):
         for w in range(-half, half + 1):
             cells.add((base_r + pr * w, base_c + pc * w))
     return cells
-
-
 def populate_token_visual(group, key, cx, cy, radius):
     data = TOKEN_LIBRARY[key]
     path = os.path.join(ASSETS_DIR, data["image"])
@@ -184,11 +385,7 @@ def populate_token_visual(group, key, cx, cy, radius):
         group.addToGroup(visual)
     else:
         print("pas d'assets pour ce token")
-
-
-# Construit une QIcon carree pour un type de token (image reduite, ou carre de
-# secours de la couleur du type si le PNG est introuvable). Utilise pour la preview
-# dans la combo de selection de token.
+#COMBO LIST
 def build_token_icon(key, size=24):
     data = TOKEN_LIBRARY[key]
     path = os.path.join(ASSETS_DIR, data["image"])
@@ -199,16 +396,13 @@ def build_token_icon(key, size=24):
     else:
         pixmap = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     return QIcon(pixmap)
-
-
+#Gere les tokens joueur/mecanismes
 class TokenItem(QGraphicsItemGroup):
     """Token pose sur la carte. Gere son propre visuel (image ou fallback), le
     highlight de zone au survol pour les types qui le prevoient (hover_range), et le
     glisser-depose : rester appuye ~0.5s "attrape" le token, le relacher sur une autre
     case le deplace, le relacher hors grille le repose a sa case de depart."""
-
     HOLD_MS = 100
-
     def __init__(self, key, row, col, radius=TOKEN_RADIUS, offset=(0, 0), z=200):
         super().__init__()
         self.key = key
@@ -237,18 +431,15 @@ class TokenItem(QGraphicsItemGroup):
         self._hold_timer = QTimer()
         self._hold_timer.setSingleShot(True)
         self._hold_timer.timeout.connect(self._start_drag)
-
     def hoverEnterEvent(self, event):
         radius = TOKEN_LIBRARY[self.key].get("hover_range")
         if radius and self.scene():
             self.scene().highlight_range(self.row, self.col, radius)
         super().hoverEnterEvent(event)
-
     def hoverLeaveEvent(self, event):
         if TOKEN_LIBRARY[self.key].get("hover_range") and self.scene():
             self.scene().clear_range_highlight()
         super().hoverLeaveEvent(event)
-
     # Clic droit (mode Fleche uniquement) : demarre le glisser d'une fleche depuis ce
     # token. Clic gauche : demarre le minuteur de hold pour le glisser-depose (position
     # de reference en absolu via scenePos(), pour un suivi fluide sans derive)
@@ -270,11 +461,9 @@ class TokenItem(QGraphicsItemGroup):
         self._drag_offset = event.scenePos() - self.scenePos()
         self._hold_timer.start(self.HOLD_MS)
         event.accept()
-
     def _start_drag(self):
         self._drag_active = True
         self.setZValue(500)
-
     # Suivi fluide en position absolue (scenePos - offset de prise), plutot qu'en
     # delta cumulatif, pour eviter toute derive pendant un glisser long. Pendant un
     # glisser de fleche, fait suivre l'apercu au curseur a la place.
@@ -289,7 +478,6 @@ class TokenItem(QGraphicsItemGroup):
             new_pos = event.scenePos() - self._drag_offset
             self.setPos(new_pos)
         event.accept()
-
     # Relachement : si un glisser de fleche etait en cours, la finalise. Sinon, si le
     # drag de token etait actif, on le deplace reellement dans les donnees
     # (scene.move_token) vers la case sous le curseur (ou on le repose a l'origine si
@@ -323,8 +511,7 @@ class TokenItem(QGraphicsItemGroup):
                 scene.remove_specific_token(self._origin_key, self)
         self._drag_offset = None
         event.accept()
-
-
+#Gere nox
 class NoxToken(TokenItem):
     """Totem Nox : une direction (N/E/S/O, tournee au clic droit) et un niveau (1 a 6,
     ajuste a la molette en survolant le token). La zone d'effet affichee au survol
@@ -349,6 +536,8 @@ class NoxToken(TokenItem):
             idx = self.DIRECTIONS.index(self.direction)
             self.direction = self.DIRECTIONS[(idx + 1) % len(self.DIRECTIONS)]
             scene = self.scene()
+            if scene:
+                scene._emit_op({"type": "nox_rotate", "row": self.row, "col": self.col, "direction": self.direction})
             if scene and scene.hovering_nox is self:
                 scene.highlight_nox(self)
             event.accept()
@@ -359,6 +548,8 @@ class NoxToken(TokenItem):
     def change_level(self, delta):
         self.level = max(self.LEVEL_MIN, min(self.LEVEL_MAX, self.level + delta))
         scene = self.scene()
+        if scene:
+            scene._emit_op({"type": "nox_level", "row": self.row, "col": self.col, "level": self.level})
         if scene and scene.hovering_nox is self:
             scene.highlight_nox(self)
 
@@ -375,13 +566,8 @@ class NoxToken(TokenItem):
             scene.clear_range_highlight()
             scene.hovering_nox = None
         event.accept()
-
-
+#ferme l'affichage des sous token apres un choix
 class PickerBackdrop(QGraphicsRectItem):
-    """Fond semi-transparent affiche derriere le popup de sous-tokens. Un clic
-    n'importe ou dessus (en dehors des icones, qui sont au-dessus) ferme le popup
-    sans rien poser."""
-
     def __init__(self, rect):
         super().__init__(rect)
         self.setBrush(QBrush(QColor(0, 0, 0, 60)))
@@ -393,8 +579,7 @@ class PickerBackdrop(QGraphicsRectItem):
         if self.scene():
             self.scene().close_token_picker()
         event.accept()
-
-
+#gere l'affichage des enfant(invo/mecanismes) d'un token joueur/classe
 class PickerIcon(QGraphicsItemGroup):
     """Une icone cliquable du popup de sous-tokens. Au clic, pose le sous-token
     choisi sur la case cible et ferme le popup."""
@@ -425,9 +610,7 @@ class PickerIcon(QGraphicsItemGroup):
             scene.place_specific_token(self.target_row, self.target_col, self.child_key)
             scene.close_token_picker()
         event.accept()
-
-
-
+#gere l'affichage des 6 joueurs et leur initiative
 class PlayerPanel(QListWidget):
     """Petit cadre flottant (coin superieur droit de la vue) listant, dans l'ordre de
     jeu, les tokens de personnages joueurs actuellement sur la carte (max MAX_PLAYERS).
@@ -447,7 +630,8 @@ class PlayerPanel(QListWidget):
         self.setWrapping(False)
         self.setMovement(QListWidget.Static)
         self.setSelectionMode(QAbstractItemView.NoSelection)  # selection geree a la main (surlignage manuel)
-        self.setDragDropMode(QAbstractItemView.NoDragDrop)  # pas de glisser-depose natif : source de bugs, remplace par clic/clic
+        self.setDragDropMode(
+            QAbstractItemView.NoDragDrop)  # pas de glisser-depose natif : source de bugs, remplace par clic/clic
         self.setIconSize(QSize(self.ICON_SIZE, self.ICON_SIZE))
         self.setSpacing(4)
         self.setFixedSize((MAX_PLAYERS + 1) * (self.ICON_SIZE + 8) + 10, self.ICON_SIZE + 22)
@@ -498,7 +682,7 @@ class PlayerPanel(QListWidget):
         pen.setWidth(2)
         painter.setPen(pen)
         painter.drawLine(w - 11, h - 1, w - 1, h - 11)  # lame
-        painter.drawLine(w - 9, h - 5, w - 5, h - 9)    # garde
+        painter.drawLine(w - 9, h - 5, w - 5, h - 9)  # garde
         painter.end()
         return composed
 
@@ -544,8 +728,7 @@ class PlayerPanel(QListWidget):
             return
 
         super().mousePressEvent(event)
-
-
+#gere les couleur, le picker, les recents etc
 class ColorSwatchButton(QPushButton):
     """Petit bouton carre affichant une couleur, avec un liseret blanc au survol."""
 
@@ -561,27 +744,18 @@ class ColorSwatchButton(QPushButton):
             f"QPushButton:hover {{ border: 2px solid white; }}"
         )
         self.setToolTip(color.name())
-
-
+#Quelques fonctions de logiques que je devrais ranger
 def isBorder(row, col):
     return row == 0 or col == 0 or row == ROWS - 1 or col == COLS - 1
-
-
 def isCorner(row, col):
     return row in [0, ROWS - 1] and col in [0, COLS - 1]
-
-
 def iso_to_screen(row, col):
     x = (col - row) * (TILE_WIDTH // 2)
     y = (col + row) * (TILE_HEIGHT // 2)
     return x, y
-
-
 def tile_center(row, col):
     x, y = iso_to_screen(row, col)
     return x + TILE_WIDTH / 2, y + TILE_HEIGHT / 2
-
-
 def add_image(scene, row, col, image_path):
     multiplier = 2 if image_path == "cube.png" else 1
     target_size = 96 * multiplier
@@ -607,18 +781,15 @@ def add_image(scene, row, col, image_path):
     )
     item.setZValue(row + col + 10)
     scene.addItem(item)
-
-
 def is_pile(row, col):
     return (
-        (row == 4 and col == 4)
-        or (row == 11 and col == 3)
-        or (row == 3 and col == 12)
-        or (row == 9 and col == 16)
-        or (row == 14 and col == 10)
+            (row == 4 and col == 4)
+            or (row == 11 and col == 3)
+            or (row == 3 and col == 12)
+            or (row == 9 and col == 16)
+            or (row == 14 and col == 10)
     )
-
-
+#gere les cases de la vue
 class IsoTile(QGraphicsPolygonItem):
     def __init__(self, row, col):
         super().__init__()
@@ -738,6 +909,7 @@ class IsoTile(QGraphicsPolygonItem):
         scene.push_undo_snapshot()
         self.color_layers.pop()
         self.setBrush(self.current_display_brush())
+        scene._emit_op({"type": "erase_tile_color", "row": self.row, "col": self.col})
 
     def activate(self, button):
         scene = self.scene()
@@ -747,6 +919,8 @@ class IsoTile(QGraphicsPolygonItem):
             scene.push_undo_snapshot()
             self.color_layers.append(QColor(scene.current_color))
             self.setBrush(self.current_display_brush())
+            scene._emit_op({"type": "paint_tile", "row": self.row, "col": self.col,
+                            "color": scene.current_color.name()})
 
         elif mode == EditorMode.TOKEN and button == Qt.LeftButton:
             scene.toggle_token(self.row, self.col)
@@ -755,8 +929,7 @@ class IsoTile(QGraphicsPolygonItem):
             scene.erase_at(self.row, self.col)
 
         print(f"Tile {self.row},{self.col} - mode {mode.name}")
-
-
+#gere l'etat de la map, tile + tokens + fleches + undo/redo
 class MapScene(QGraphicsScene):
     def __init__(self):
         super().__init__()
@@ -783,41 +956,111 @@ class MapScene(QGraphicsScene):
         self.nox_element = "eau"  # element actuellement selectionne pour le hover du Nox
         self.hovering_nox = None  # instance de NoxToken actuellement survolee
         self.player_order = []  # references directes vers les entrees de tokens "player", dans l'ordre de jeu (max MAX_PLAYERS)
-
+        self._applying_remote_op = False
+        self.on_local_op = None
+    def apply_remote_op(self, op):
+        self._applying_remote_op = True
+        try:
+            kind = op["type"]
+            if kind == "paint_tile":
+                tile = self.tiles.get((op["row"], op["col"]))
+                if tile:
+                    tile.color_layers.append(QColor(op["color"]))
+                    tile.setBrush(tile.current_display_brush())
+            elif kind == "erase_tile_color":
+                tile = self.tiles.get((op["row"], op["col"]))
+                if tile:
+                    tile.reset_color()
+            elif kind == "toggle_token":
+                self._place_or_toggle(op["row"], op["col"], op["token_type"])
+            elif kind == "remove_specific_token":
+                entries = self.tokens.get((op["row"], op["col"]))
+                if entries:
+                    entry = next((e for e in entries if e["type"] == op["token_type"]), None)
+                    if entry:
+                        self._remove_token_entry((op["row"], op["col"]), entry)
+                        self.update_rails()
+            elif kind == "move_token":
+                entries = self.tokens.get((op["origin_row"], op["origin_col"]))
+                if entries:
+                    entry = next((e for e in entries if e["type"] == op["token_type"]), None)
+                    if entry:
+                        self.move_token(entry["item"], (op["origin_row"], op["origin_col"]),
+                                        (op["target_row"], op["target_col"]))
+            elif kind == "place_specific_token":
+                self.place_specific_token(op["row"], op["col"], op["token_type"])
+            elif kind == "add_arrow":
+                self.add_arrow(tuple(op["start"]), tuple(op["end"]), QColor(op["color"]))
+            elif kind == "erase_cell":
+                self.erase_at(op["row"], op["col"])
+            elif kind == "nox_rotate":
+                entries = self.tokens.get((op["row"], op["col"]))
+                if entries:
+                    entry = next((e for e in entries if e["type"] == "nox"), None)
+                    if entry and isinstance(entry["item"], NoxToken):
+                        entry["item"].direction = op["direction"]
+            elif kind == "nox_level":
+                entries = self.tokens.get((op["row"], op["col"]))
+                if entries:
+                    entry = next((e for e in entries if e["type"] == "nox"), None)
+                    if entry and isinstance(entry["item"], NoxToken):
+                        entry["item"].level = op["level"]
+            elif kind == "clear_all":
+                self.apply_remote_clear_all()
+        finally:
+            self._applying_remote_op = False
+    def apply_remote_clear_all(self):
+        for entries in list(self.tokens.values()):
+            for entry in list(entries):
+                self.removeItem(entry["item"])
+        self.tokens.clear()
+        for arrow in self.arrows:
+            self.removeItem(arrow["item"])
+        self.arrows.clear()
+        for item in self.rail_items:
+            self.removeItem(item)
+        self.rail_items.clear()
+        for tile in self.tiles.values():
+            tile.color_layers = []
+            tile.setBrush(tile.current_display_brush())
+        self.active_picker = None
+        self.hovering_nox = None
+        self.player_order = []
+        if self.main_window:
+            self.main_window.refresh_player_panel()
+    def _emit_op(self, op):
+        if self._applying_remote_op:
+            return
+        if self.on_local_op:
+            self.on_local_op(op)
     def set_mode(self, mode):
         self.mode = mode
         if self.main_window:
             action = self.main_window.mode_actions.get(mode)
             if action:
                 action.setChecked(True)
-
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         self.drag_visited.clear()
-
     def tile_at(self, scene_pos):
         for it in self.items(scene_pos):
             if isinstance(it, IsoTile):
                 return (it.row, it.col)
         return None
-
     def add_recent_color(self, color):
         hex_val = color.name()
         self.recent_colors = [c for c in self.recent_colors if c.name() != hex_val]
         self.recent_colors.insert(0, QColor(color))
         self.recent_colors = self.recent_colors[:6]
-
     @staticmethod
     def _stack_offset(index):
         return (index * 18, -index * 14)
-
     def _add_token_entry(self, row, col, token_type, state=None):
         key = (row, col)
         entries = self.tokens.setdefault(key, [])
         entries.append({"item": None, "type": token_type, "state": state or {}})
         self._restack(key)
         return entries[-1]
-
     # Cree le bon type d'item pour une entree de token : NoxToken (avec sa direction/
     # son niveau restaures) pour "nox", TokenItem classique sinon
     def _make_token_item(self, token_type, row, col, offset, state):
@@ -829,7 +1072,6 @@ class MapScene(QGraphicsScene):
                 offset=offset,
             )
         return TokenItem(token_type, row, col, offset=offset)
-
     def _restack(self, key):
         entries = self.tokens.get(key)
         if not entries:
@@ -858,7 +1100,6 @@ class MapScene(QGraphicsScene):
             new_entries.append(new_entry)
         for po_i, old_i in player_order_links:
             self.player_order[po_i] = new_entries[old_i]
-
     def _remove_token_entry(self, key, entry):
         entries = self.tokens.get(key)
         if not entries or entry not in entries:
@@ -873,7 +1114,6 @@ class MapScene(QGraphicsScene):
             self._restack(key)
         else:
             del self.tokens[key]
-
     def capture_snapshot(self):
         entry_location = {
             id(e): (pos, i)
@@ -902,7 +1142,6 @@ class MapScene(QGraphicsScene):
             "arrows": [(a["start"], a["end"], QColor(a["color"])) for a in self.arrows],
             "player_order": [entry_location[id(e)] for e in self.player_order if id(e) in entry_location],
         }
-
     def restore_snapshot(self, snapshot):
         for entries in self.tokens.values():
             for entry in entries:
@@ -944,13 +1183,13 @@ class MapScene(QGraphicsScene):
 
         self.hovering_nox = None
         self.update_rails()
-
     def push_undo_snapshot(self):
+        if self._applying_remote_op:
+            return
         self.undo_stack.append(self.capture_snapshot())
         if len(self.undo_stack) > self.max_history:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
-
     def undo(self):
         if not self.undo_stack:
             return
@@ -958,7 +1197,6 @@ class MapScene(QGraphicsScene):
         snapshot = self.undo_stack.pop()
         self.redo_stack.append(current)
         self.restore_snapshot(snapshot)
-
     def redo(self):
         if not self.redo_stack:
             return
@@ -966,10 +1204,9 @@ class MapScene(QGraphicsScene):
         snapshot = self.redo_stack.pop()
         self.undo_stack.append(current)
         self.restore_snapshot(snapshot)
-
     def toggle_token(self, row, col):
         self._place_or_toggle(row, col, self.current_token_key)
-
+        self._emit_op({"type": "toggle_token", "row": row, "col": col, "token_type": self.current_token_key})
     # Pose ou retire un type de token precis sur une case. Comportement selon la
     # categorie du type (voir TOKEN_LIBRARY["category"]) :
     #  - "player" (les 18 classes) : jamais unique (doublons permis), mais plafonne a
@@ -1017,7 +1254,6 @@ class MapScene(QGraphicsScene):
 
         self._add_token_entry(row, col, token_type)
         self.update_rails()
-
     def show_token_picker(self, row, col, children_keys):
         self.close_token_picker()
 
@@ -1036,7 +1272,6 @@ class MapScene(QGraphicsScene):
             icons.append(icon)
 
         self.active_picker = {"backdrop": backdrop, "icons": icons}
-
     def close_token_picker(self):
         if not self.active_picker:
             return
@@ -1044,12 +1279,11 @@ class MapScene(QGraphicsScene):
         for icon in self.active_picker["icons"]:
             self.removeItem(icon)
         self.active_picker = None
-
     def place_specific_token(self, row, col, token_type):
         self.push_undo_snapshot()
         self._add_token_entry(row, col, token_type)
         self.update_rails()
-
+        self._emit_op({"type": "place_specific_token", "row": row, "col": col, "token_type": token_type})
     def move_token(self, token_item, origin_key, target_key):
         origin_entries = self.tokens.get(origin_key)
         if not origin_entries:
@@ -1057,6 +1291,7 @@ class MapScene(QGraphicsScene):
         entry = next((e for e in origin_entries if e["item"] is token_item), None)
         if entry is None:
             return
+        token_type = entry["type"]  # capture avant mutation, pour l'emission plus bas
 
         if target_key == origin_key:
             self._restack(origin_key)
@@ -1088,13 +1323,15 @@ class MapScene(QGraphicsScene):
         self._restack(target_key)
 
         if player_order_idx is not None:
-            # l'ancienne entree a ete detruite/recreee par _restack(target_key) ; comme on
-            # vient de l'ajouter en dernier avant reconstruction, elle est toujours la
-            # derniere de la case cible une fois reconstruite
             self.player_order[player_order_idx] = self.tokens[target_key][-1]
 
         self.update_rails()
-
+        self._emit_op({
+            "type": "move_token",
+            "origin_row": origin_key[0], "origin_col": origin_key[1],
+            "target_row": target_key[0], "target_col": target_key[1],
+            "token_type": token_type,
+        })
     def remove_specific_token(self, key, item):
         entries = self.tokens.get(key)
         if not entries:
@@ -1105,7 +1342,7 @@ class MapScene(QGraphicsScene):
         self.push_undo_snapshot()
         self._remove_token_entry(key, entry)
         self.update_rails()
-
+        self._emit_op({"type": "remove_specific_token", "row": key[0], "col": key[1], "token_type": entry["type"]})
     def highlight_range(self, row, col, radius, element="default"):
         color = ELEMENT_COLORS.get(element, ELEMENT_COLORS["default"])
         self.clear_range_highlight()
@@ -1113,7 +1350,6 @@ class MapScene(QGraphicsScene):
             if abs(r - row) + abs(c - col) <= radius:
                 tile.set_highlight(color)
                 self.range_highlighted.append((r, c))
-
     # Calcule et surligne la zone d'effet du totem Nox survole, selon l'element
     # actuellement selectionne dans la toolbar (eau/air/feu/terre), sa direction et
     # son niveau
@@ -1174,7 +1410,6 @@ class MapScene(QGraphicsScene):
             if tile:
                 tile.set_highlight(color)
                 self.range_highlighted.append(pos)
-
     def clear_range_highlight(self):
         for pos in self.range_highlighted:
             tile = self.tiles.get(pos)
@@ -1185,7 +1420,6 @@ class MapScene(QGraphicsScene):
         for item in self.highlight_overlays:
             self.removeItem(item)
         self.highlight_overlays = []
-
     # Ajoute un losange translucide independant sur une case (au lieu de teinter la
     # case elle-meme) : plusieurs overlays sur la meme case s'empilent visuellement
     # au lieu de s'ecraser l'un l'autre (utilise pour les anneaux de joueurs qui
@@ -1202,7 +1436,6 @@ class MapScene(QGraphicsScene):
         overlay.setZValue(60)  # au-dessus des cases/etiquettes, en-dessous des tokens
         self.addItem(overlay)
         self.highlight_overlays.append(overlay)
-
     def update_rails(self):
         for item in self.rail_items:
             self.removeItem(item)
@@ -1247,7 +1480,6 @@ class MapScene(QGraphicsScene):
             link_row(row, cols)
         for col, rows in by_col.items():
             link_col(col, rows)
-
     def _place_rail_token(self, row, col):
         for existing in self.rail_items:
             if isinstance(existing, TokenItem) and (existing.row, existing.col) == (row, col):
@@ -1255,7 +1487,6 @@ class MapScene(QGraphicsScene):
         badge = TokenItem("steamer_rail", row, col, radius=16, z=140)
         self.addItem(badge)
         self.rail_items.append(badge)
-
     # Trouve la couleur de fleche associee a un token, selon sa position dans le
     # panneau de joueurs (1er -> bleu, 2e -> rose, etc.). Couleur neutre par defaut
     # pour les tokens hors panneau (mecanismes, Nox).
@@ -1264,7 +1495,6 @@ class MapScene(QGraphicsScene):
             if entry.get("item") is token_item and i < len(ARROW_COLORS):
                 return ARROW_COLORS[i]
         return ARROW_DEFAULT_COLOR
-
     # Demarre le glisser d'une fleche depuis un token (clic droit maintenu, voir
     # TokenItem.mousePressEvent) : cree une ligne d'apercu qui suivra le curseur
     def start_arrow_drag(self, token_item, scene_pos):
@@ -1279,14 +1509,12 @@ class MapScene(QGraphicsScene):
             "color": color,
             "line": line,
         }
-
     # Fait suivre l'apercu de fleche au curseur pendant le glisser
     def update_arrow_drag(self, scene_pos):
         if not self.arrow_drag:
             return
         p1 = self.arrow_drag["line"].line().p1()
         self.arrow_drag["line"].setLine(p1.x(), p1.y(), scene_pos.x(), scene_pos.y())
-
     # Relachement du clic droit : pose la fleche definitive si on est retombe sur une
     # case valide et differente du depart, sinon annule simplement l'apercu
     def finish_arrow_drag(self, scene_pos):
@@ -1300,7 +1528,8 @@ class MapScene(QGraphicsScene):
         if target_key and target_key != drag["start_key"]:
             self.push_undo_snapshot()
             self.add_arrow(drag["start_key"], target_key, drag["color"])
-
+            self._emit_op({"type": "add_arrow", "start": list(drag["start_key"]),
+                           "end": list(target_key), "color": drag["color"].name()})
     def add_arrow(self, start, end, color=None):
         color = color or ARROW_DEFAULT_COLOR
         x1, y1 = tile_center(*start)
@@ -1331,13 +1560,11 @@ class MapScene(QGraphicsScene):
         group.setZValue(150)
         self.addItem(group)
         self.arrows.append({"start": start, "end": end, "item": group, "color": color})
-
     def erase_at(self, row, col):
         self.push_undo_snapshot()
         key = (row, col)
 
         if key in self.tokens and self.tokens[key]:
-            # plusieurs items empiles sur une case -> on ne retire que le dernier pose
             self._remove_token_entry(key, self.tokens[key][-1])
             self.update_rails()
 
@@ -1354,6 +1581,7 @@ class MapScene(QGraphicsScene):
             tile.color_layers = []
             tile.setBrush(tile.current_display_brush())
 
+        self._emit_op({"type": "erase_cell", "row": row, "col": col})
     # Serialise tout l'etat modifiable de la carte (couleurs, tokens, fleches, ordre
     # des joueurs, element Nox selectionne) en un dict JSON-compatible, pour
     # l'export/la sauvegarde sur disque
@@ -1393,7 +1621,6 @@ class MapScene(QGraphicsScene):
             ],
             "nox_element": self.nox_element,
         }
-
     # Reconstruit l'etat de la carte a partir d'un dict issu de to_dict (import/
     # ouverture d'un fichier). A appeler sur une scene deja videe et regrillee
     # (voir MainWindow.import_map), pas besoin de push_undo_snapshot ici.
@@ -1426,7 +1653,6 @@ class MapScene(QGraphicsScene):
             self.main_window.sync_nox_element_button()
 
         self.update_rails()
-
     def clear_all(self):
         self.clear()
         self.tiles.clear()
@@ -1439,8 +1665,7 @@ class MapScene(QGraphicsScene):
         self.player_order = []
         if self.main_window:
             self.main_window.refresh_player_panel()
-
-
+#gere la vue graphique qui affiche la carte isometrique et gere le zoom/pan
 class IsoView(QGraphicsView):
     def __init__(self):
         super().__init__()
@@ -1449,14 +1674,12 @@ class IsoView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        # zoom centre sur le curseur plutot que sur le centre de la vue
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.scene.setBackgroundBrush(QBrush(QColor("#0f1319")))
+        self.setStyleSheet("background-color: #1a1a1a; border: none;")
 
-        # glisser dans le vide (aucune case/token sous le clic, ex: les coins hors du
-        # losange de la carte) fait defiler la camera. Les cases/tokens acceptent deja
-        # eux-memes leurs clics (event.accept()), donc ce mode ne s'active jamais par-dessus
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.main_window = None  # branche par MainWindow apres construction
+        self.main_window = None
         self.draw_map()
 
     def draw_map(self):
@@ -1536,30 +1759,30 @@ class IsoView(QGraphicsView):
             self.scale(zoom_factor, zoom_factor)
         else:
             self.scale(1 / zoom_factor, 1 / zoom_factor)
+#onglets
+class MapTab(QWidget):
+    """Un onglet = une carte independante : sa propre vue/scene (creees par
+    IsoView), son panneau de joueurs, et son chemin de fichier courant pour
+    Sauvegarder. main_window et scene.main_window sont branches par
+    MainWindow.add_new_tab juste apres la construction."""
 
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Nox Map Editor")
-        self.resize(1100, 750)
-        self.current_file_path = None  # None tant qu'aucun fichier n'a ete importe/exporte
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_file_path = None
 
         self.view = IsoView()
-        self.setCentralWidget(self.view)
-        if self.view.scene:
-            self.view.scene.setBackgroundBrush(QBrush(QColor("#0f1319")))
-        self.view.setStyleSheet("background-color: #1a1a1a; border: none;")
-        self.build_toolbar()
-        self.view.scene.main_window = self
-        self.view.main_window = self
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.view)
 
         self.player_panel = PlayerPanel(self.view.scene, parent=self.view)
         self.player_panel.refresh()
         self.reposition_player_panel()
+        self.network_role = None
+        self.network = None
+        self.network_bridge = None
 
-    # Recale le panneau de joueurs dans le coin superieur droit de la vue (appele a la
-    # construction et a chaque redimensionnement de la fenetre)
     def reposition_player_panel(self):
         margin = 10
         x = self.view.width() - self.player_panel.width() - margin
@@ -1568,12 +1791,221 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, "player_panel"):
-            self.reposition_player_panel()
+        self.reposition_player_panel()
+#gere les onglets, la toolbar et le reseau
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Nox Map Editor")
+        self.resize(1100, 750)
 
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setDrawBase(False)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBarDoubleClicked.connect(self.rename_tab)
+        self.tabs.tabBarClicked.connect(self.on_tab_bar_clicked)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.setCentralWidget(self.tabs)
+        self.tabs.setStyleSheet(
+            """
+            QTabWidget::pane {
+                border: none;
+                background-color: #0f1319;
+                top: -1px;
+            }
+            QTabWidget::tab-bar {
+                left: 0px;
+                background-color: #14171c;
+            }
+            QTabWidget {
+                background-color: #14171c;
+            }
+            QTabBar {
+                background-color: #14171c;
+            }
+            QTabBar::tab {
+                background-color: #1f232a;
+                color: #9aa0a6;
+                border: 1px solid #2c313a;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 6px 16px;
+                margin-right: 2px;
+                font-size: 12px;
+            }
+            QTabBar::tab:hover {
+                background-color: #272c34;
+                color: #e8e8e8;
+            }
+            QTabBar::tab:selected {
+                background-color: #4c5fd5;
+                color: white;
+                border-color: #6c7fee;
+            }
+            QTabBar::close-button {
+                image: none;
+                subcontrol-position: right;
+            }
+            QTabBar::close-button:hover {
+                background-color: rgba(255,255,255,40);
+                border-radius: 3px;
+            }
+            """
+        )
+
+        # L'onglet "+" est un vrai onglet (peint par QTabBar, meme style, aucune
+        # zone non couverte possible), pas un corner widget. Il est cree une seule
+        # fois et reste toujours en derniere position (voir add_new_tab/close_tab).
+        self.tab_counter = 0
+        self._add_plus_tab()
+        self.add_new_tab()  # au moins une carte AVANT la toolbar
+        self.build_toolbar()  # la toolbar lit l'etat de l'onglet actif
+    def host_session(self):
+        tab = self.current_tab()
+        password = generate_password()
+        bridge = NetworkBridge()
+        server = HostServer(tab.view.scene, password, bridge)
+        server.start(port=5555)
+
+        tab.network_role = "host"
+        tab.network = server
+        tab.view.scene.on_local_op = server.send_op
+
+        bridge.op_received.connect(tab.view.scene.apply_remote_op)
+        tab.network_bridge = bridge  # garder une reference, sinon le GC peut la detruire
+
+        ip = get_local_ip()
+        QMessageBox.information(self, "Session hébergée",
+                                f"IP : {ip}\nPort : 5555\nMot de passe : {password}")
+    def connect_session(self):
+        ip, ok1 = QInputDialog.getText(self, "Connexion", "IP de l'hôte :")
+        if not ok1 or not ip.strip():
+            return
+        password, ok2 = QInputDialog.getText(self, "Connexion", "Mot de passe :")
+        if not ok2:
+            return
+
+        tab = self.add_new_tab()
+        bridge = NetworkBridge()
+        client = ClientConnection(bridge)
+
+        def on_snapshot(snapshot):
+            tab.view.scene.clear_all()
+            tab.view.draw_map()
+            tab.view.scene.load_dict(snapshot)
+            tab.view.scene.on_local_op = client.send_op
+
+        bridge.snapshot_received.connect(on_snapshot)
+        bridge.op_received.connect(tab.view.scene.apply_remote_op)
+        bridge.auth_failed.connect(lambda: QMessageBox.warning(self, "Connexion refusée", "Mot de passe incorrect."))
+
+        tab.network_role = "client"
+        tab.network = client
+        tab.network_bridge = bridge
+
+        try:
+            client.connect(ip.strip(), 5555, password.strip())
+        except OSError as exc:
+            QMessageBox.warning(self, "Connexion impossible", str(exc))
+    def sync_toolbar_to_scene(self, scene):
+        action = self.mode_actions.get(scene.mode)
+        if action:
+            action.setChecked(True)
+
+        self.current_color_swatch.set_color(scene.current_color)
+        self.rebuild_palette()
+
+        self._sync_token_combo_display(scene.current_token_key)
+
+        btn = self.nox_element_buttons.get(scene.nox_element)
+        if btn:
+            btn.setChecked(True)
+    # Met a jour category_combo/token_combo pour REFLETER token_key, sans jamais
+    # toucher au mode ni au current_token_key de la scene (contrairement a
+    # on_category_changed/set_token_type, qui sont les slots declenches par
+    # l'utilisateur et qui eux doivent basculer en mode Token)
+    def _sync_token_combo_display(self, token_key):
+        data = TOKEN_LIBRARY.get(token_key, {})
+        category = data.get("category")
+
+        cat_idx = self.category_combo.findData(category)
+        if cat_idx != -1 and cat_idx != self.category_combo.currentIndex():
+            self.category_combo.blockSignals(True)
+            self.category_combo.setCurrentIndex(cat_idx)
+            self.category_combo.blockSignals(False)
+            self._populate_token_combo(category)
+
+        idx = self.token_combo.findData(token_key)
+        if idx != -1:
+            self.token_combo.blockSignals(True)
+            self.token_combo.setCurrentIndex(idx)
+            self.token_combo.blockSignals(False)
+    # Repeuple token_combo pour une categorie sans rien selectionner ni toucher
+    # au mode (utilise par on_category_changed ET par _sync_token_combo_display)
+    def _populate_token_combo(self, category):
+        self.token_combo.blockSignals(True)
+        self.token_combo.clear()
+        for key, data in TOKEN_LIBRARY.items():
+            if data.get("auto_only"):
+                continue
+            if data.get("category") == category:
+                self.token_combo.addItem(build_token_icon(key), data["label"], key)
+        self.token_combo.blockSignals(False)
+    # Cree l'onglet "+" une seule fois, comme dernier onglet non fermable. Comme
+    # c'est un vrai onglet peint par QTabBar, il herite du style existant sans
+    # aucune zone non couverte (contrairement a l'ancien corner widget).
+    def _add_plus_tab(self):
+        placeholder = QWidget()
+        self.tabs.addTab(placeholder, "+")
+        self.plus_tab_index = self.tabs.count() - 1
+        self.tabs.tabBar().setTabButton(self.plus_tab_index, QTabBar.RightSide, None)
+    # Clic sur un onglet quelconque de la tab bar : si c'est l'onglet "+", cree
+    # une nouvelle carte a la place (au lieu de "switcher" dessus, qui est vide)
+    def on_tab_bar_clicked(self, index):
+        if index == self.plus_tab_index:
+            self.add_new_tab()
+    def add_new_tab(self):
+        self.tab_counter += 1
+        tab = MapTab()
+        tab.view.scene.main_window = self
+        tab.view.main_window = self
+        insert_at = self.plus_tab_index
+        self.tabs.insertTab(insert_at, tab, f"{self.tab_counter}")
+        self.plus_tab_index += 1
+        self.tabs.setCurrentIndex(insert_at)
+        return tab
+    def close_tab(self, index):
+        if index == self.plus_tab_index:
+            return  # on ne peut pas fermer le bouton "+"
+        if self.tabs.count() - 1 <= 1:
+            return  # toujours garder au moins une carte ouverte (le "+" ne compte pas)
+        widget = self.tabs.widget(index)
+        self.tabs.removeTab(index)
+        widget.deleteLater()
+        if index < self.plus_tab_index:
+            self.plus_tab_index -= 1
+    def rename_tab(self, index):
+        if index == self.plus_tab_index:
+            return
+        current_name = self.tabs.tabText(index)
+        name, ok = QInputDialog.getText(self, "Renommer l'onglet", "Nom :", text=current_name)
+        if ok and name.strip():
+            self.tabs.setTabText(index, name.strip())
+    def current_tab(self):
+        return self.tabs.currentWidget()
+    def on_tab_changed(self, index):
+        if not hasattr(self, "mode_actions"):
+            return  # toolbar pas encore construite (premier onglet)
+        tab = self.current_tab()
+        if isinstance(tab, MapTab):
+            self.sync_toolbar_to_scene(tab.view.scene)
     def refresh_player_panel(self):
-        self.player_panel.refresh()
-
+        tab = self.current_tab()
+        if isinstance(tab, MapTab):
+            tab.player_panel.refresh()
     def build_toolbar(self):
         toolbar = QToolBar("Outils")
         toolbar.setMovable(False)
@@ -1665,7 +2097,7 @@ class MainWindow(QMainWindow):
         def make_mode_action(label, mode):
             action = QAction(label, self)
             action.setCheckable(True)
-            action.triggered.connect(lambda: self.view.scene.set_mode(mode))
+            action.triggered.connect(lambda: self.current_tab().view.scene.set_mode(mode))
             mode_group.addAction(action)
             toolbar.addAction(action)
             self.mode_actions[mode] = action
@@ -1680,7 +2112,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addWidget(QLabel(" Couleur : "))
 
-        self.current_color_swatch = ColorSwatchButton(self.view.scene.current_color)
+        self.current_color_swatch = ColorSwatchButton(self.current_tab().view.scene.current_color)
         self.current_color_swatch.clicked.connect(self.pick_tile_color)
         toolbar.addWidget(self.current_color_swatch)
 
@@ -1722,20 +2154,20 @@ class MainWindow(QMainWindow):
             self.nox_element_group.addButton(btn)
             toolbar.addWidget(btn)
             self.nox_element_buttons[key] = btn
-            if key == self.view.scene.nox_element:
+            if key == self.current_tab().view.scene.nox_element:
                 btn.setChecked(True)
 
         toolbar.addSeparator()
 
         undo_action = QAction("Undo", self)
         undo_action.setShortcut(QKeySequence.Undo)
-        undo_action.triggered.connect(lambda: self.view.scene.undo())
+        undo_action.triggered.connect(lambda: self.current_tab().view.scene.undo())
         toolbar.addAction(undo_action)
         self.addAction(undo_action)
 
         redo_action = QAction("Redo", self)
         redo_action.setShortcut(QKeySequence.Redo)
-        redo_action.triggered.connect(lambda: self.view.scene.redo())
+        redo_action.triggered.connect(lambda: self.current_tab().view.scene.redo())
         toolbar.addAction(redo_action)
         self.addAction(redo_action)
 
@@ -1754,26 +2186,31 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self.save_map)
         toolbar.addAction(save_action)
         self.addAction(save_action)
+        toolbar.addSeparator()
 
+        host_action = QAction("Host", self)
+        host_action.triggered.connect(self.host_session)
+        toolbar.addAction(host_action)
+
+        connect_action = QAction("Connect", self)
+        connect_action.triggered.connect(self.connect_session)
+        toolbar.addAction(connect_action)
         toolbar.addSeparator()
 
         clear_action = QAction("Tout effacer", self)
         clear_action.triggered.connect(self.clear_scene)
         toolbar.addAction(clear_action)
-
     def pick_tile_color(self):
-        color = QColorDialog.getColor(self.view.scene.current_color, self, "Choisir une couleur de case")
+        color = QColorDialog.getColor(self.current_tab().view.scene.current_color, self, "Choisir une couleur de case")
         if color.isValid():
             self.apply_paint_color(color)
-
     def apply_paint_color(self, color):
-        scene = self.view.scene
+        scene = self.current_tab().view.scene
         scene.current_color = color
         scene.add_recent_color(color)
         scene.set_mode(EditorMode.PAINT)
         self.current_color_swatch.set_color(color)
         self.rebuild_palette()
-
     def rebuild_palette(self):
         layout = self.palette_container.layout()
         while layout.count():
@@ -1782,40 +2219,29 @@ class MainWindow(QMainWindow):
             if widget:
                 widget.deleteLater()
 
-        for color in self.view.scene.recent_colors:
+        for color in self.current_tab().view.scene.recent_colors:
             swatch = ColorSwatchButton(color)
             swatch.clicked.connect(lambda checked=False, c=QColor(color): self.apply_paint_color(c))
             layout.addWidget(swatch)
-
     # Repeuple la combo de type de token avec uniquement les entrees de la categorie
     # choisie (mecanisme/invocation, personnage joueur, ou nox)
     def on_category_changed(self, index):
         category = self.category_combo.itemData(index)
-        self.token_combo.blockSignals(True)
-        self.token_combo.clear()
-        for key, data in TOKEN_LIBRARY.items():
-            if data.get("auto_only"):
-                continue
-            if data.get("category") == category:
-                self.token_combo.addItem(build_token_icon(key), data["label"], key)
-        self.token_combo.blockSignals(False)
+        self._populate_token_combo(category)
         if self.token_combo.count() > 0:
             self.token_combo.setCurrentIndex(0)
             self.set_token_type(0)
-
     def set_token_type(self, index):
-        scene = self.view.scene
+        scene = self.current_tab().view.scene
         scene.current_token_key = self.token_combo.itemData(index)
         scene.set_mode(EditorMode.TOKEN)
-
     # Change l'element utilise pour le hover des totems Nox, et rafraichit le
     # surlignage immediatement si un Nox est en train d'etre survole
     def set_nox_element(self, key):
-        scene = self.view.scene
+        scene = self.current_tab().view.scene
         scene.nox_element = key
         if scene.hovering_nox:
             scene.highlight_nox(scene.hovering_nox)
-
     # Molette dans le vide en mode Token : passe au type suivant/precedent dans la combo
     def cycle_token_type(self, direction):
         count = self.token_combo.count()
@@ -1823,11 +2249,10 @@ class MainWindow(QMainWindow):
             return
         idx = (self.token_combo.currentIndex() + direction) % count
         self.token_combo.setCurrentIndex(idx)
-
     # Molette dans le vide en mode Peindre : passe a la couleur precedente/suivante
     # dans l'historique recent (sans le reordonner, contrairement a un clic sur la palette)
     def cycle_paint_color(self, direction):
-        scene = self.view.scene
+        scene = self.current_tab().view.scene
         colors = scene.recent_colors
         if not colors:
             return
@@ -1837,18 +2262,17 @@ class MainWindow(QMainWindow):
         idx = (idx + direction) % len(colors)
         scene.current_color = QColor(colors[idx])
         self.current_color_swatch.set_color(scene.current_color)
-
     def clear_scene(self):
-        self.view.scene.clear_all()
-        self.view.draw_map()
-
+        tab = self.current_tab()
+        tab.view.scene.clear_all()
+        tab.view.draw_map()
+        tab.view.scene._emit_op({"type": "clear_all"})
     # Coche le bon bouton d'element Nox apres un import (qui change scene.nox_element
     # directement, sans passer par set_nox_element)
     def sync_nox_element_button(self):
-        btn = self.nox_element_buttons.get(self.view.scene.nox_element)
+        btn = self.nox_element_buttons.get(self.current_tab().view.scene.nox_element)
         if btn:
             btn.setChecked(True)
-
     # Charge une carte depuis un fichier JSON choisi par l'utilisateur : vide la
     # carte actuelle, la reconstruit vierge, puis y applique l'etat charge. Le
     # fichier choisi devient le fichier courant (utilise ensuite par Sauvegarder).
@@ -1863,11 +2287,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import impossible", f"Impossible de lire ce fichier :\n{exc}")
             return
 
-        self.view.scene.clear_all()
-        self.view.draw_map()
-        self.view.scene.load_dict(data)
-        self.current_file_path = path
-
+        self.current_tab().view.scene.clear_all()
+        self.current_tab().view.draw_map()
+        self.current_tab().view.scene.load_dict(data)
+        self.current_tab().current_file_path = path
     # Exporte la carte actuelle vers un fichier JSON choisi par l'utilisateur (avec
     # dialogue "Enregistrer sous"). Le fichier choisi devient le fichier courant.
     def export_map(self):
@@ -1877,21 +2300,20 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith(".json"):
             path += ".json"
         if self._write_map(path):
-            self.current_file_path = path
-
+            self.current_tab().current_file_path = path
     # Ctrl+S / bouton Sauvegarder : ecrit directement sur le fichier courant s'il y
     # en a deja un (pas de dialogue). S'il n'y a pas encore de fichier courant (jamais
     # importe/exporte), se comporte comme Exporter (demande ou sauvegarder).
     def save_map(self):
-        if self.current_file_path:
-            self._write_map(self.current_file_path)
+        tab = self.current_tab()
+        if tab.current_file_path:
+            self._write_map(tab.current_file_path)
         else:
             self.export_map()
-
     # Ecrit l'etat actuel de la carte au format JSON vers `path`. Retourne True en
     # cas de succes, False sinon (et affiche un message d'erreur).
     def _write_map(self, path):
-        data = self.view.scene.to_dict()
+        data = self.current_tab().view.scene.to_dict()
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -1899,10 +2321,9 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "Sauvegarde impossible", f"Impossible d'ecrire ce fichier :\n{exc}")
             return False
-
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
