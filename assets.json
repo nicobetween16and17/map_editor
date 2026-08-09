@@ -1,0 +1,207 @@
+{
+    "feca": {
+      "label": "Féca",
+      "image": "feca.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "osamodas": {
+      "label": "Osamodas",
+      "image": "osamodas.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "enutrof": {
+      "label": "Enutrof",
+      "image": "enutrof.png",
+      "category": "player"
+    },
+    "sram": {
+      "label": "Sram",
+      "image": "sram.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "xelor": {
+      "label": "Xelor",
+      "image": "xelor.png",
+      "offset_y": 0,
+      "category": "player",
+      "children": ["xelor_cadran", "rouage", "sinistro", "regu"]
+    },
+    "ecaflip": {
+      "label": "Ecaflip",
+      "image": "ecaflip.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "eniripsa": {
+      "label": "Eniripsa",
+      "image": "eniripsa.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "iop": {
+      "label": "Iop",
+      "image": "iop.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "cra": {
+      "label": "Cra",
+      "image": "cra.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "sadida": {
+      "label": "Sadida",
+      "image": "sadida.png",
+      "offset_y": 0,
+      "category": "player",
+      "children": ["surpuissante", "bloqueuse", "sacrif", "goulue", "arbre", "gonflable", "graine"]},
+    "sacrieur": {
+      "label": "Sacrieur",
+      "image": "sacrieur.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "pandawa": {
+      "label": "Pandawa",
+      "image": "pandawa.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "roublard": {
+      "label": "Roublard",
+      "image": "roublard.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "zobal": {
+      "label": "Zobal",
+      "image": "zobal.png",
+      "offset_y": 0,
+      "category": "player"},
+    "eliotrope": {
+      "label": "Eliotrope",
+      "image": "eliotrope.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "huppermage": {
+      "label": "Huppermage",
+      "image": "huppermage.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "ouginak": {
+      "label": "Ouginak",
+      "image": "ouginak.png",
+      "offset_y": 0,
+      "category": "player"
+    },
+    "steamer": {
+      "label": "Steamer",
+      "image": "steamer.png",
+      "offset_y": 0,
+      "category": "player",
+      "children": ["steamer_microbot", "steamer_turret"]
+    },
+    "xelor_cadran": {
+      "label": "Cadran (Xelor)",
+      "image": "xelor_cadran.png",
+      "hover_range": 3,
+      "offset_y": 8,
+      "category": "mechanism",
+      "unique": true
+    },
+    "eni_lapin": {
+      "label": "Lapin (Eniripsa)",
+      "image": "eni_lapin.png",
+      "offset_y": 0,
+      "category": "mechanism",
+      "unique": true},
+    "surpuissante": {
+      "label": "Surpuissante (Sadida)",
+      "image": "sadida_surpuissante.png",
+      "offset_y": -8,
+      "category": "mechanism"
+    },
+    "bloqueuse": {
+      "label": "bloqueuse (Sadida)",
+      "image": "bloqueuse.png",
+      "offset_y": -8,
+      "category": "mechanism"
+    },
+    "goulue": {
+      "label": "goulue (Sadida)",
+      "image": "goulue.png",
+      "offset_y": -7,
+      "category": "mechanism"
+    },
+    "gonflable": {
+      "label": "gonflable (Sadida)",
+      "image": "gonflable.png",
+      "offset_y": -2,
+      "category": "mechanism"
+    },
+    "arbre": {
+      "label": "arbre (Sadida)",
+      "image": "arbre.png",
+      "offset_y": -1,
+      "category": "mechanism"
+    },
+    "sacrif": {
+      "label": "sacrif (Sadida)",
+      "image": "sacrif.png",
+      "offset_y": -1,
+      "category": "mechanism"
+    },
+    "graine": {
+      "label": "graine (Sadida)",
+      "image": "graine.png",
+      "offset_y": -16,
+      "category": "mechanism"
+    },
+    "steamer_microbot": {
+      "label": "Microbot (Steamer)",
+      "image": "steamer_microbot.png",
+      "rail": true,
+      "offset_y": -16,
+      "category": "mechanism"
+    },
+    "steamer_turret": {
+      "label": "Tourelle (Steamer)",
+      "image": "tourelle.png",
+      "offset_y": 0, "category": "mechanism"},
+    "rouage": {
+      "label": "rouage (Xelor)",
+      "image": "rouage.png",
+      "offset_y": -8,
+      "category": "mechanism"
+    },
+    "regu": {"label": "regulateur (Xelor)",
+      "image": "regu.png",
+      "offset_y": -4,
+      "category": "mechanism"
+    },
+    "sinistro": {
+      "label": "sinistro (Xelor)",
+      "image": "sinistro.png",
+      "offset_y": -2,
+      "category": "mechanism"
+    },
+    "steamer_rail": {
+      "label": "Rail (Steamer)",
+      "image": "steamer_rail.png",
+      "auto_only": true,
+      "offset_y": -16,
+      "category": "mechanism"
+    },
+    "nox": {
+      "label": "Totem Nox",
+      "image": "nox.png",
+      "offset_y": 0,
+      "category": "nox",
+      "unique": true}
+}

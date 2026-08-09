@@ -9,6 +9,7 @@ echo ===================================================
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo Python n'est pas detecte. Telechargement de l'installateur officiel...
+    winget install -e --id cURL.cURL
     curl -L -o python_installer.exe https://python.org
 
     echo Installation silencieuse de Python en cours, merci de patienter...

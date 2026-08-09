@@ -37,22 +37,55 @@ from PyQt5.QtWidgets import (
     QDialog,
     QVBoxLayout
 )
+import urllib.request
 from PyQt5.QtGui import QPolygonF, QBrush, QColor, QPen, QPainter, QPixmap, QFont, QKeySequence, QIcon
 from PyQt5.QtCore import QPointF, Qt, QTimer, QSize, QObject, pyqtSignal
 from enum import Enum
 import socket
 import secrets
 import threading
+import miniupnpc
 TILE_WIDTH = 64
 TILE_HEIGHT = 32
 ROWS = 16
 COLS = 18
 
 # RESEAU
+def open_port_upnp(port, description="Nox Map Editor"):
+    """Tente d'ouvrir automatiquement `port` en TCP sur le routeur via UPnP.
+    Renvoie (succes: bool, message_erreur: str ou None)."""
+    try:
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 200
+        devices_found = u.discover()
+        if devices_found == 0:
+            return False, "Aucun routeur compatible UPnP trouvé sur le réseau."
+        u.selectigd()
+        local_ip = u.lanaddr
+        u.addportmapping(port, "TCP", local_ip, port, description, "")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+def close_port_upnp(port):
+    """Retire la redirection de port ouverte par open_port_upnp, si possible."""
+    try:
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 200
+        if u.discover() > 0:
+            u.selectigd()
+            u.deleteportmapping(port, "TCP")
+    except Exception:
+        pass  # best-effort : pas grave si le nettoyage echoue
+def get_public_ip():
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as response:
+            return response.read().decode("utf-8").strip()
+    except Exception:
+        return None
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
+        s.connect(("8.8.8.8", 80))  # pas de vrai trafic envoye, juste pour choisir l'interface
         ip = s.getsockname()[0]
     except OSError:
         ip = "127.0.0.1"
@@ -2022,6 +2055,45 @@ class MainWindow(QMainWindow):
         self.addAction(help_action)
         self.shortcut_actions["aide"] = help_action
         self.setToolTip("F1 = Raccourcis Clavier")
+    def host_session(self):
+        tab = self.current_tab()
+        password = generate_password()
+        bridge = NetworkBridge()
+        server = HostServer(tab.view.scene, password, bridge)
+        server.start(port=5555)
+
+        tab.network_role = "host"
+        tab.network = server
+        tab.view.scene.on_local_op = server.send_op
+        bridge.op_received.connect(tab.view.scene.apply_remote_op)
+        tab.network_bridge = bridge
+
+        local_ip = get_local_ip()
+        msg = f"Mot de passe : {password}\n LAN : {local_ip}:5555\n\n"
+
+        success, error = open_port_upnp(5555)
+        if success:
+            public_ip = get_public_ip()
+            if public_ip:
+                msg += f"WAN : {public_ip}:5555\nSucces: port ouvert par UPnP"
+            else:
+                msg += "Fail : IP publique introuvable."
+        else:
+            msg += (
+                f"Ouverture automatique du port impossible ({error}).\n"
+                "Ton routeur n'a peut-être pas l'UPnP activé, ou ton FAI bloque cette fonctionnalité.\n"
+                "Solution de secours : configure la redirection de port manuellement sur ta box,\n"
+                "ou utilise playit.gg."
+            )
+
+        QMessageBox.information(self, "Session hébergée", msg)
+    def closeEvent(self, event):
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, MapTab) and tab.network_role == "host":
+                close_port_upnp(5555)
+                tab.network.stop()
+        super().closeEvent(event)
     # sous-fenetre d'aide
     def toggle_shortcuts_dialog(self):
         if self.shortcuts_dialog is None:
@@ -2055,11 +2127,20 @@ class MainWindow(QMainWindow):
         tab.view.scene.on_local_op = server.send_op
 
         bridge.op_received.connect(tab.view.scene.apply_remote_op)
-        tab.network_bridge = bridge  # garder une reference, sinon le GC peut la detruire
+        tab.network_bridge = bridge
 
-        ip = get_local_ip()
-        QMessageBox.information(self, "Session hébergée",
-                                f"IP : {ip}\nPort : 5555\nMot de passe : {password}")
+        local_ip = get_local_ip()
+        public_ip = get_public_ip()
+
+        msg = f"Mot de passe : {password}\nPort : 5555\n\n"
+        msg += f"LAN : {local_ip}\n"
+        if public_ip:
+            msg += f"WAN : {public_ip}\n"
+            msg += "need config modem connexion 5555 | 5555 | tcp | *ton ip locale*"
+        else:
+            msg += "Fail, ip publique non trouvée"
+
+        QMessageBox.information(self, "Session hébergée", msg)
     def connect_session(self):
         ip, ok1 = QInputDialog.getText(self, "Connexion", "IP de l'hôte :")
         if not ok1 or not ip.strip():
