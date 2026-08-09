@@ -34,6 +34,8 @@ from PyQt5.QtWidgets import (
     QTabWidget,
     QTabBar,
     QInputDialog,
+    QDialog,
+    QVBoxLayout
 )
 from PyQt5.QtGui import QPolygonF, QBrush, QColor, QPen, QPainter, QPixmap, QFont, QKeySequence, QIcon
 from PyQt5.QtCore import QPointF, Qt, QTimer, QSize, QObject, pyqtSignal
@@ -46,10 +48,7 @@ TILE_HEIGHT = 32
 ROWS = 16
 COLS = 18
 
-#
 # RESEAU
-#
-
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -60,20 +59,14 @@ def get_local_ip():
     finally:
         s.close()
     return ip
-
-
 def generate_password():
     return f"{secrets.randbelow(1_000_000):06d}"
-
-
 class NetworkBridge(QObject):
     op_received = pyqtSignal(dict)
     snapshot_received = pyqtSignal(dict)
     auth_failed = pyqtSignal()
     client_count_changed = pyqtSignal(int)
     disconnected = pyqtSignal()
-
-
 class HostServer:
     def __init__(self, scene, password, bridge):
         self.scene = scene
@@ -156,8 +149,6 @@ class HostServer:
             self.server_socket.close()
         for c in self.clients:
             c.close()
-
-
 class ClientConnection:
     def __init__(self, bridge):
         self.bridge = bridge
@@ -208,21 +199,16 @@ class ClientConnection:
         self._running = False
         if self.sock:
             self.sock.close()
-
 class EditorMode(Enum):
     PAINT = 0
     TOKEN = 1
     ARROW = 2
     ERASE = 3
-
 #
 # TOKENS/INFO
 #
-
 ASSETS_DIR = "assets/tokens"
-
 TOKEN_RADIUS = 20
-
 ELEMENT_COLORS = {
     "eau": QColor(0, 120, 255, 50),
     "feu": QColor(255, 50, 50, 50),
@@ -230,7 +216,6 @@ ELEMENT_COLORS = {
     "air": QColor(150, 0, 255, 50),
     "default": QColor(255, 255, 255, 120),
 }
-
 TOKEN_LIBRARY = {
     "feca": {"label": "Féca", "image": "feca.png", "color": QColor(120, 170, 90), "offset_y": 0, "category": "player"},
     "osamodas": {"label": "Osamodas", "image": "osamodas.png", "color": QColor(150, 110, 60), "offset_y": 0,
@@ -303,7 +288,6 @@ TOKEN_LIBRARY = {
     "nox": {"label": "Totem Nox", "image": "nox.png", "color": QColor(80, 80, 95), "offset_y": 0, "category": "nox",
             "unique": True},
 }
-
 RAIL_MAX_LENGTH = 8  # deux microbots ne forment un rail que si la case de depart a la case d'arrivee incluses tient sur 8 cases max
 MAX_PLAYERS = 6  # nombre maximum de tokens de categorie "player" simultanement sur la carte
 ARROW_COLORS = [
@@ -315,12 +299,70 @@ ARROW_COLORS = [
     QColor("red"),
 ]
 ARROW_DEFAULT_COLOR = QColor("white")
-
 # ---------- geometrie des zones du totem Nox ----------
 DIRECTION_VECTORS = {"N": (-1, 0), "S": (1, 0), "E": (0, 1), "O": (0, -1)}
 OPPOSITE_DIRECTION = {"N": "S", "S": "N", "E": "O", "O": "E"}
-
-
+COL_LABELS = ["Placeholder", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S"]
+ROW_LABELS = ["Placeholder", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "", ""]
+SHORTCUTS_FILE = "raccourcis.json"
+DEFAULT_SHORTCUTS = {
+    "peindre": "P",
+    "token": "T",
+    "fleche": "F",
+    "effacer": "E",
+    "couleur": "K",
+    "save": "Ctrl+S",
+    "import": "Ctrl+I",
+    "export": "Ctrl+X",
+    "tout_effacer": "Ctrl+E",
+    "onglet_suivant": "Tab",
+    "onglet_precedent": "Shift+Tab",
+    "host": "H",
+    "connect": "C",
+    "aide": "F1",
+}
+# Libelles humains pour chaque cle, utilises dans la fenetre de raccourcis (F1)
+SHORTCUT_LABELS = {
+    "peindre": "Mode Peindre",
+    "token": "Mode Token",
+    "fleche": "Mode Fleche",
+    "effacer": "Mode Effacer",
+    "couleur": "Choisir une couleur",
+    "save": "Sauvegarder",
+    "import": "Importer",
+    "export": "Exporter",
+    "tout_effacer": "Tout effacer",
+    "onglet_suivant": "Onglet suivant",
+    "onglet_precedent": "Onglet precedent",
+    "host": "Heberger une session",
+    "connect": "Se connecter a une session",
+    "aide": "Afficher/masquer cette fenetre",
+}
+#Gestion des shortcuts
+def load_shortcuts():
+    if os.path.exists(SHORTCUTS_FILE):
+        try:
+            with open(SHORTCUTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # merge avec les defauts : une cle manquante (nouvelle version, fichier
+            # utilisateur pas a jour) retombe sur sa valeur par defaut plutot que
+            # de faire planter l'app
+            merged = dict(DEFAULT_SHORTCUTS)
+            merged.update(data)
+            return merged
+        except (OSError, json.JSONDecodeError):
+            pass
+    return dict(DEFAULT_SHORTCUTS)
+def save_shortcuts(shortcuts):
+    with open(SHORTCUTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(shortcuts, f, indent=2, ensure_ascii=False)
+#fonction utilitaire servant a labeliser les cases
+def tile_label(row, col):
+    """Convertit (row, col) en etiquette lisible type 'A12', dans le meme systeme
+    que les etiquettes affichees sur les bords de la carte (voir IsoView.draw_map)."""
+    if 0 <= col < len(COL_LABELS) and 0 <= row < len(ROW_LABELS):
+        return f"{COL_LABELS[col]}{ROW_LABELS[row]}"
+    return ""
 # calculs de zones et affichage de tokens
 def cone_cells(apex, direction, depth):
     """Cone triangulaire classique : ouvert dans `direction`, apex a `apex`, la rangee
@@ -757,7 +799,9 @@ def tile_center(row, col):
     x, y = iso_to_screen(row, col)
     return x + TILE_WIDTH / 2, y + TILE_HEIGHT / 2
 def add_image(scene, row, col, image_path):
-    multiplier = 2 if image_path == "cube.png" else 1
+    multiplier = 1.8 if image_path == "assets/MapElements/cube.png" else 1
+    offsetx = 2 if image_path == "assets/MapElements/cube.png" else 0
+    offsety = 11 if image_path == "assets/MapElements/cube.png" else 0
     target_size = 96 * multiplier
     pixmap = QPixmap(image_path)
     if pixmap.isNull():
@@ -772,8 +816,8 @@ def add_image(scene, row, col, image_path):
     item.setTransformationMode(Qt.SmoothTransformation)
     item.setScale(scale_factor)
 
-    w = pixmap.width() * scale_factor
-    h = pixmap.height() * scale_factor
+    w = pixmap.width() * scale_factor + offsetx
+    h = pixmap.height() * scale_factor + offsety
     x, y = iso_to_screen(row, col)
     item.setPos(
         x + TILE_WIDTH / 2 - w / 2,
@@ -1681,12 +1725,16 @@ class IsoView(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.main_window = None
         self.draw_map()
-
+        self.coord_label = QLabel(self)
+        self.coord_label.setStyleSheet(
+            "background-color: rgba(20,20,25,220); color: #e8e8e8; border: 1px solid #3d434f;"
+            "border-radius: 4px; padding: 2px 6px; font-size: 11px;"
+        )
+        self.coord_label.hide()
+        self.setMouseTracking(True)
     def draw_map(self):
-        cols = ["Placeholder", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
-                "S"]
-        rows = ["Placeholder", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "",
-                ""]
+        cols = COL_LABELS
+        rows = ROW_LABELS
         font = QFont("Consolas", 11, QFont.Bold)
 
         for row in range(ROWS):
@@ -1719,15 +1767,12 @@ class IsoView(QGraphicsView):
                     self.scene.addItem(text)
 
                 if is_pile(row, col):
-                    add_image(self.scene, row, col, "pile.png")
+                    add_image(self.scene, row, col, "assets/MapElements/pile.png")
                 if row == 7 and col == 9:
-                    add_image(self.scene, row, col, "cube.png")
+                    add_image(self.scene, row, col, "assets/MapElements/cube.png")
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect())
-
-    # Molette : si le curseur est sur un totem Nox, change son niveau. Sinon, si le
-    # curseur est dans le vide (hors de toute case, ex: les coins hors du losange),
-    # cycle le token ou la couleur selectionne selon le mode actif. Sinon, zoom normal.
+    # Molette = zoom sauf sur Tokens Nox=level+- Token basiques=select tokensuivant
     def wheelEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         items_here = self.scene.items(scene_pos)
@@ -1759,13 +1804,31 @@ class IsoView(QGraphicsView):
             self.scale(zoom_factor, zoom_factor)
         else:
             self.scale(1 / zoom_factor, 1 / zoom_factor)
+    # Affiche les coord
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        scene_pos = self.mapToScene(event.pos())
+        key = self.scene.tile_at(scene_pos)
+        if key:
+            label = tile_label(*key)
+            if label:
+                self.coord_label.setText(label)
+                self.coord_label.adjustSize()
+                self.coord_label.move(event.pos().x() + 16, event.pos().y() + 12)
+                self.coord_label.show()
+            else:
+                self.coord_label.hide()
+        else:
+            self.coord_label.hide()
+    def leaveEvent(self, event):
+        self.coord_label.hide()
+        super().leaveEvent(event)
 #onglets
 class MapTab(QWidget):
     """Un onglet = une carte independante : sa propre vue/scene (creees par
     IsoView), son panneau de joueurs, et son chemin de fichier courant pour
     Sauvegarder. main_window et scene.main_window sont branches par
     MainWindow.add_new_tab juste apres la construction."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_file_path = None
@@ -1782,23 +1845,112 @@ class MapTab(QWidget):
         self.network_role = None
         self.network = None
         self.network_bridge = None
-
     def reposition_player_panel(self):
         margin = 10
         x = self.view.width() - self.player_panel.width() - margin
         self.player_panel.move(x, margin)
         self.player_panel.raise_()
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.reposition_player_panel()
 #gere les onglets, la toolbar et le reseau
+# Fenetre listant tous les raccourcis clavier, ouverte via F1 ou ?
+# Fenetre listant tous les raccourcis clavier, cliquables pour les reassigner.
+# Ouverte via F1 (touche configurable) ou ?
+class ShortcutsDialog(QDialog):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("Raccourcis clavier")
+        self.setStyleSheet(
+            """
+            QDialog { background-color: #14171c; }
+            QLabel#sectionTitle { color: #6c7fee; font-size: 13px; font-weight: bold; padding-top: 8px; }
+            QLabel#shortcutDesc { color: #9aa0a6; font-size: 12px; }
+            QPushButton#shortcutKey {
+                background-color: #1f232a; color: #e8e8e8; border: 1px solid #3d434f;
+                border-radius: 4px; padding: 2px 8px; font-size: 12px; font-family: Consolas;
+            }
+            QPushButton#shortcutKey:hover { border-color: #6c7fee; }
+            QPushButton#shortcutKey:checked { background-color: #4c5fd5; border-color: #6c7fee; color: white; }
+            """
+        )
+
+        self.sections = {
+            "Modes": ["peindre", "token", "fleche", "effacer", "couleur"],
+            "Fichier": ["save", "import", "export", "tout_effacer"],
+            "Onglets": ["onglet_suivant", "onglet_precedent"],
+            "Reseau": ["host", "connect"],
+            "Aide": ["aide"],
+        }
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(4)
+
+        self.key_buttons = {}  # cle -> QPushButton, pour rafraichir apres reassignation
+        self._capturing_key = None  # cle actuellement en attente d'une frappe, ou None
+
+        for section_title, keys in self.sections.items():
+            title = QLabel(section_title)
+            title.setObjectName("sectionTitle")
+            layout.addWidget(title)
+
+            for key in keys:
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(8, 2, 0, 2)
+
+                btn = QPushButton(self.main_window.shortcuts[key])
+                btn.setObjectName("shortcutKey")
+                btn.setCheckable(True)
+                btn.setFixedWidth(90)
+                btn.clicked.connect(lambda checked, k=key, b=btn: self._start_capture(k, b))
+                self.key_buttons[key] = btn
+
+                desc_label = QLabel(SHORTCUT_LABELS[key])
+                desc_label.setObjectName("shortcutDesc")
+
+                row_layout.addWidget(btn)
+                row_layout.addWidget(desc_label)
+                row_layout.addStretch()
+                layout.addWidget(row)
+
+        hint = QLabel("Cliquez sur une touche puis appuyez sur la nouvelle combinaison.")
+        hint.setStyleSheet("color: #6c7076; font-size: 11px; padding-top: 8px;")
+        layout.addWidget(hint)
+
+        self.setFixedWidth(340)
+
+    # Le bouton clique attend la prochaine frappe clavier pour se reassigner
+    def _start_capture(self, key, btn):
+        if self._capturing_key and self._capturing_key != key:
+            self.key_buttons[self._capturing_key].setChecked(False)
+        self._capturing_key = key
+        btn.setChecked(True)
+        btn.setText("...")
+
+    # Intercepte les frappes de tout le dialogue pendant une capture
+    def keyPressEvent(self, event):
+        if not self._capturing_key:
+            super().keyPressEvent(event)
+            return
+
+        key = self._capturing_key
+        sequence = QKeySequence(event.modifiers() | event.key()).toString()
+        if not sequence or event.key() in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            return  # ignore une frappe de modificateur seul (Ctrl/Shift/Alt sans autre touche)
+
+        self.main_window.set_shortcut(key, sequence)
+        self.key_buttons[key].setText(sequence)
+        self.key_buttons[key].setChecked(False)
+        self._capturing_key = None
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Nox Map Editor")
         self.resize(1100, 750)
-
+        self.shortcuts = load_shortcuts()
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.setDocumentMode(True)
@@ -1855,7 +2007,6 @@ class MainWindow(QMainWindow):
             }
             """
         )
-
         # L'onglet "+" est un vrai onglet (peint par QTabBar, meme style, aucune
         # zone non couverte possible), pas un corner widget. Il est cree une seule
         # fois et reste toujours en derniere position (voir add_new_tab/close_tab).
@@ -1863,6 +2014,35 @@ class MainWindow(QMainWindow):
         self._add_plus_tab()
         self.add_new_tab()  # au moins une carte AVANT la toolbar
         self.build_toolbar()  # la toolbar lit l'etat de l'onglet actif
+        self.shortcuts_dialog = None
+        self.shortcut_actions["aide"] = None  # sera remplace juste apres
+        help_action = QAction("Aide", self)
+        help_action.setShortcuts([self.shortcuts["aide"], "?"])
+        help_action.triggered.connect(self.toggle_shortcuts_dialog)
+        self.addAction(help_action)
+        self.shortcut_actions["aide"] = help_action
+        self.setToolTip("F1 = Raccourcis Clavier")
+    # sous-fenetre d'aide
+    def toggle_shortcuts_dialog(self):
+        if self.shortcuts_dialog is None:
+            self.shortcuts_dialog = ShortcutsDialog(self)
+        if self.shortcuts_dialog.isVisible():
+            self.shortcuts_dialog.hide()
+        else:
+            self.shortcuts_dialog.show()
+            self.shortcuts_dialog.raise_()
+            self.shortcuts_dialog.activateWindow()
+    # changer les raccourcis
+    def set_shortcut(self, key, new_sequence):
+        self.shortcuts[key] = new_sequence
+        save_shortcuts(self.shortcuts)
+
+        action = self.shortcut_actions.get(key)
+        if action:
+            if key == "aide":
+                action.setShortcuts([new_sequence, "?"])
+            else:
+                action.setShortcut(new_sequence)
     def host_session(self):
         tab = self.current_tab()
         password = generate_password()
@@ -1996,6 +2176,22 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(index, name.strip())
     def current_tab(self):
         return self.tabs.currentWidget()
+    def select_next_tab(self):
+        count = self.tabs.count()
+        if count <= 1:
+            return
+        next_idx = (self.tabs.currentIndex() + 1) % count
+        if next_idx == self.plus_tab_index:
+            next_idx = (next_idx + 1) % count
+        self.tabs.setCurrentIndex(next_idx)
+    def select_previous_tab(self):
+        count = self.tabs.count()
+        if count <= 1:
+            return
+        prev_idx = (self.tabs.currentIndex() - 1) % count
+        if prev_idx == self.plus_tab_index:
+            prev_idx = (prev_idx - 1) % count
+        self.tabs.setCurrentIndex(prev_idx)
     def on_tab_changed(self, index):
         if not hasattr(self, "mode_actions"):
             return  # toolbar pas encore construite (premier onglet)
@@ -2093,20 +2289,28 @@ class MainWindow(QMainWindow):
         mode_group = QActionGroup(self)
         mode_group.setExclusive(True)
         self.mode_actions = {}
+        self.shortcut_actions = {}
 
-        def make_mode_action(label, mode):
+        def make_mode_action(label, mode, shortcut=None):
             action = QAction(label, self)
             action.setCheckable(True)
             action.triggered.connect(lambda: self.current_tab().view.scene.set_mode(mode))
+            if shortcut:
+                action.setShortcut(shortcut)
             mode_group.addAction(action)
             toolbar.addAction(action)
+            self.addAction(action)
             self.mode_actions[mode] = action
             return action
 
-        paint_action = make_mode_action("Peindre", EditorMode.PAINT)
-        make_mode_action("Token", EditorMode.TOKEN)
-        make_mode_action("Fleche", EditorMode.ARROW)
-        make_mode_action("Effacer", EditorMode.ERASE)
+        paint_action = make_mode_action("Peindre", EditorMode.PAINT, self.shortcuts["peindre"])
+        self.shortcut_actions["peindre"] = paint_action
+        token_action = make_mode_action("Token", EditorMode.TOKEN, self.shortcuts["token"])
+        self.shortcut_actions["token"] = token_action
+        arrow_action = make_mode_action("Fleche", EditorMode.ARROW, self.shortcuts["fleche"])
+        self.shortcut_actions["fleche"] = arrow_action
+        erase_action = make_mode_action("Effacer", EditorMode.ERASE, self.shortcuts["effacer"])
+        self.shortcut_actions["effacer"] = erase_action
         paint_action.setChecked(True)
 
         toolbar.addSeparator()
@@ -2174,14 +2378,20 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         import_action = QAction("Import", self)
+        import_action.setShortcut(self.shortcuts["import"])
+        self.shortcut_actions["import"] = import_action
         import_action.triggered.connect(self.import_map)
         toolbar.addAction(import_action)
 
         export_action = QAction("Export", self)
+        export_action.setShortcut(self.shortcuts["export"])
+        self.shortcut_actions["export"] = export_action
         export_action.triggered.connect(self.export_map)
         toolbar.addAction(export_action)
 
         save_action = QAction("Save", self)
+        save_action.setShortcut(self.shortcuts["save"])
+        self.shortcut_actions["save"] = save_action
         save_action.setShortcut(QKeySequence.Save)  # Ctrl+S
         save_action.triggered.connect(self.save_map)
         toolbar.addAction(save_action)
@@ -2189,17 +2399,41 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         host_action = QAction("Host", self)
+        host_action.setShortcut(self.shortcuts["host"])
+        self.shortcut_actions["host"] = host_action
         host_action.triggered.connect(self.host_session)
         toolbar.addAction(host_action)
 
         connect_action = QAction("Connect", self)
+        connect_action.setShortcut(self.shortcuts["connect"])
+        self.shortcut_actions["connect"] = connect_action
         connect_action.triggered.connect(self.connect_session)
         toolbar.addAction(connect_action)
         toolbar.addSeparator()
 
         clear_action = QAction("Tout effacer", self)
+        clear_action.setShortcut(self.shortcuts["tout_effacer"])
+        self.shortcut_actions["tout_effacer"] = clear_action
         clear_action.triggered.connect(self.clear_scene)
         toolbar.addAction(clear_action)
+
+        color_picker_action = QAction("Choisir couleur", self)
+        color_picker_action.setShortcut(self.shortcuts["couleur"])
+        self.shortcut_actions["couleur"] = color_picker_action
+        color_picker_action.triggered.connect(self.pick_tile_color)
+        self.addAction(color_picker_action)
+
+        next_tab_action = QAction("Onglet suivant", self)
+        next_tab_action.setShortcut(self.shortcuts["onglet_suivant"])
+        self.shortcut_actions["onglet_suivant"] = next_tab_action
+        next_tab_action.triggered.connect(self.select_next_tab)
+        self.addAction(next_tab_action)
+
+        prev_tab_action = QAction("Onglet precedent", self)
+        prev_tab_action.setShortcut(self.shortcuts["onglet_precedent"])
+        self.shortcut_actions["onglet_precedent"] = prev_tab_action
+        prev_tab_action.triggered.connect(self.select_previous_tab)
+        self.addAction(prev_tab_action)
     def pick_tile_color(self):
         color = QColorDialog.getColor(self.current_tab().view.scene.current_color, self, "Choisir une couleur de case")
         if color.isValid():

@@ -1,0 +1,16 @@
+{
+  "peindre": "W",
+  "token": "T",
+  "fleche": "F",
+  "effacer": "E",
+  "couleur": "K",
+  "save": "Ctrl+S",
+  "import": "Ctrl+I",
+  "export": "Ctrl+X",
+  "tout_effacer": "Ctrl+E",
+  "onglet_suivant": "Tab",
+  "onglet_precedent": "Shift+Tab",
+  "host": "H",
+  "connect": "C",
+  "aide": "F1"
+}
