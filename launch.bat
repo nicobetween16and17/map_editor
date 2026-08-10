@@ -7,21 +7,22 @@ echo ===================================================
 
 :: 1. Verifier si Python est installe sur le systeme
 python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Python n'est pas detecte. Telechargement de l'installateur officiel...
-    winget install -e --id cURL.cURL
-    curl -L -o python_installer.exe https://python.org
 
-    echo Installation silencieuse de Python en cours, merci de patienter...
-    python_installer.exe /quiet InstallAllUsers=0 PrependPath=1 Include_test=0
-    del python_installer.exe
+if errorlevel 1 (
+    echo Python n'est pas detecte.
+    echo Installation de Python 64 bits...
 
-    :: Force Windows a rafraichir ses variables d'environnement
-    set "PATH=%USERPROFILE%\AppData\Local\Programs\Python\Python311\;%USERPROFILE%\AppData\Local\Programs\Python\Python311\Scripts\;%PATH%"
-
-    echo Python a ete installe avec succes !
+    winget install --id Python.Python.3.13 -e --source winget --accept-source-agreements --accept-package-agreements
+    if errorlevel 1 (
+        echo.
+        echo ERREUR : impossible d'installer Python automatiquement.
+        echo Installe Python 64 bits depuis python.org puis relance ce fichier.
+        pause
+        exit /b 1
+    )
+    :: Recharger le PATH
+    set "PATH=%LOCALAPPDATA%\Programs\Python\Python313;%LOCALAPPDATA%\Programs\Python\Python313\Scripts;%PATH%"
 )
-
 :: 2. Creer l'environnement virtuel local s'il n'existe pas
 if not exist ".venv" (
     echo Creation de l'environnement virtuel venv...
